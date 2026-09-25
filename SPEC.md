@@ -1,70 +1,59 @@
-# Architectural Specification: targetBugBounty
+# Architectural Specification: api-spec-extractor
 
 ## Overview
-`targetBugBounty` is a high-speed reconnaissance and static analysis tool designed for Bug Bounty hunters auditing client-side web applications (Next.js, Webpack, Vite, React, Vue).
-It fetches public JavaScript bundles, formats them, performs AST/Regex extraction of routes and state variables, and passes candidate code chunks to Opus 5.5 for semantic vulnerability auditing (undocumented routes, mass assignment risks, exposed role checks, leaked keys).
+`api-spec-extractor` is a high-performance developer tool designed to reverse-engineer client-side web bundles (Webpack, Vite, Next.js, Rollup) and produce clean, fully-typed OpenAPI 3.0 specifications and API route maps.
 
-## Core Pipeline
+## Architecture
 
 ```
-[Target URL / JS File]
-        │
-        ▼
+[Target URL / Local JS Files]
+             │
+             ▼
 [Fetcher Module (fetcher.py)]
-  - Download scripts from HTML/URL
-  - Extract sourcemaps if available
-  - Beautify JS files
-        │
-        ▼
+  - Download scripts and sourcemaps
+  - Beautify minified JavaScript
+             │
+             ▼
 [Extractor Module (extractor.py)]
-  - Extract API paths & endpoints (/api/*, /v1/*, GraphQL)
-  - Extract Next.js page props (__NEXT_DATA__)
-  - Extract potential hardcoded secrets & auth headers
-        │
-        ▼
-[Opus Auditor (auditor.py)]
-  - Defensive SAST prompt to Claude Opus 5.5
-  - Identify mass-assignment parameters & hidden admin flags
-  - Output structured JSON audit report
-        │
-        ▼
-[Report Generator (reporter.py)]
-  - Generate HackerOne/Bugcrowd markdown triage report
+  - Regex and AST pattern matching for API routes (/api/*, /v[1-9]/*, GraphQL)
+  - Extract Next.js page props and client-side state models
+  - Extract request methods and query parameters
+             │
+             ▼
+[Schema Builder Module (schema_builder.py)]
+  - Leverage Claude Opus 5.5 to synthesize routes into valid OpenAPI 3.0 paths
+  - Deduce requestBody and parameter schemas from frontend mutation calls
+             │
+             ▼
+[Exporter Module (exporter.py)]
+  - Export openapi.json and openapi.yaml
+  - Generate human-readable Markdown API Documentation
 ```
 
 ## Module Specifications
 
 ### 1. `config.py`
-- Loads `.env` using `python-dotenv`.
-- Stores `ANTHROPIC_API_KEY`, default model (`claude-3-opus-20240229` or latest Opus 5.5 alias), output directory paths.
+- Typed configuration class loading from `.env`.
+- Parameters: `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` (default `claude-3-opus-20240229`), `OUTPUT_DIR`, `MAX_SCRIPTS`, `REQUEST_TIMEOUT`.
 
 ### 2. `fetcher.py`
-- Downloads HTML from target URL, parses `<script src="...">` tags.
-- Downloads scripts asynchronously or concurrently with realistic browser headers.
-- Formats minified JS using `jsbeautifier`.
-- Saves raw and beautified files into `workspace/targets/<domain>/`.
+- Concurrent downloading of client-side assets from target web applications.
+- Filters out common third-party analytics and tracking scripts.
+- Beautifies minified code using `jsbeautifier`.
 
 ### 3. `extractor.py`
-- Regular expressions and parsing heuristics for endpoints, methods, parameters.
-- Extracts JSON payloads, Next.js props, router routes.
-- Filters out static assets (`.png`, `.svg`, `.css`, etc.).
+- Regex patterns for API route discovery (`/api/`, `/v1/`, `/v2/`, `/auth/`, `/users/`, `/admin/`, etc.).
+- Identifies associated HTTP verbs (GET, POST, PUT, DELETE, PATCH).
+- Extracts client-side payload models, mutation state, and query string patterns.
 
-### 4. `auditor.py`
-- Integrates with Anthropic Python SDK.
-- Sends chunks of extracted routes and controller code with a defensive SAST prompt.
-- Receives JSON responses detailing:
-  - Route catalog with HTTP methods.
-  - Potential IDOR parameter candidates.
-  - Suspect Mass Assignment fields (`role`, `isAdmin`, `status`, `balance`, etc.).
-  - Hardcoded tokens or internal URLs.
+### 4. `schema_builder.py`
+- Uses Anthropic API SDK to construct formal OpenAPI 3.0 path items and component schemas from code extracts.
+- Handles rate-limiting and token batching.
 
-### 5. `reporter.py`
-- Takes the findings from `extractor.py` and `auditor.py`.
-- Formats a standard Markdown report adhering to HackerOne / Bugcrowd submission guidelines.
+### 5. `exporter.py`
+- Writes validated `openapi.json`, `openapi.yaml`.
+- Produces a summary Markdown document with route tables, methods, and parameters.
 
 ### 6. `main.py`
-- CLI entrypoint with `argparse`.
-- Commands:
-  - `--url <TARGET_URL>`: Run full recon pipeline on target.
-  - `--file <LOCAL_JS>`: Audit local JavaScript file.
-  - `--output <DIR>`: Specify output report path.
+- CLI interface using `argparse` and `rich.console`.
+- Commands: `--url <URL>`, `--file <JS_PATH>`, `--output <DIR>`, `--dry-run`.
