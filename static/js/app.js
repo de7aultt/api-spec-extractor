@@ -46,6 +46,44 @@ function formatBounty(target) {
   return "Bounty offered";
 }
 
+async function parseApiResponse(response) {
+  const contentType = response.headers.get("content-type") || "";
+  const statusLine = `HTTP ${response.status}: ${response.statusText}`;
+  if (contentType.includes("application/json")) {
+    let data = null;
+    try {
+      data = await response.json();
+    } catch (parseError) {
+      return { ok: false, data: null, error: `${statusLine} (invalid JSON body)` };
+    }
+    if (!response.ok) {
+      const message = data && data.error ? data.error : statusLine;
+      return { ok: false, data, error: message };
+    }
+    return { ok: true, data, error: null };
+  }
+  let text = "";
+  try {
+    text = await response.text();
+  } catch (readError) {
+    text = "";
+  }
+  const readable = extractReadableText(text);
+  const message = readable ? `${statusLine} - ${readable}` : statusLine;
+  return { ok: false, data: null, error: response.ok ? `Unexpected response format. ${message}` : message };
+}
+
+function extractReadableText(rawText) {
+  if (!rawText) {
+    return "";
+  }
+  const parsed = new DOMParser().parseFromString(rawText, "text/html");
+  const heading = parsed.querySelector("h1, title");
+  const source = heading && heading.textContent.trim() ? heading.textContent : parsed.body ? parsed.body.textContent : rawText;
+  const collapsed = (source || "").replace(/\s+/g, " ").trim();
+  return collapsed.length > 200 ? `${collapsed.slice(0, 200)}...` : collapsed;
+}
+
 async function loadTargets(forceRefresh) {
   const statusEl = document.getElementById("radar-status");
   const resultsEl = document.getElementById("radar-results");
@@ -60,9 +98,9 @@ async function loadTargets(forceRefresh) {
   }
   try {
     const response = await fetch(`/api/targets?${params.toString()}`);
-    const data = await response.json();
-    if (!response.ok) {
-      statusEl.textContent = data.error || "Failed to load targets.";
+    const { ok, data, error } = await parseApiResponse(response);
+    if (!ok) {
+      statusEl.textContent = `Failed to load targets: ${error}`;
       return;
     }
     renderTargets(data.targets || []);
@@ -125,10 +163,10 @@ async function startScan(url) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url: cleanUrl })
     });
-    const data = await response.json();
-    if (!response.ok) {
+    const { ok, error } = await parseApiResponse(response);
+    if (!ok) {
       if (manualStatus) {
-        manualStatus.textContent = data.error || "Failed to start scan.";
+        manualStatus.textContent = `Failed to start scan: ${error}`;
       }
       return;
     }
@@ -192,7 +230,12 @@ async function loadJobs() {
   const listEl = document.getElementById("jobs-list");
   try {
     const response = await fetch("/api/scan");
-    const data = await response.json();
+    const { ok, data, error } = await parseApiResponse(response);
+    if (!ok) {
+      listEl.innerHTML = `<div class="text-sm text-red-400">Failed to load jobs: ${escapeHtml(error)}</div>`;
+      scheduleJobPolling([]);
+      return;
+    }
     const jobs = data.jobs || [];
     if (!jobs.length) {
       listEl.innerHTML = `<div class="text-sm text-slate-400">No scans yet. Launch one from the Target Radar or the manual scan box above.</div>`;

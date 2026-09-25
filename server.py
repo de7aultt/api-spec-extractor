@@ -1,3 +1,4 @@
+import re
 import subprocess
 import sys
 import threading
@@ -7,6 +8,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from flask import Flask, Response, abort, jsonify, render_template, request, send_file
+from werkzeug.exceptions import HTTPException, InternalServerError, NotFound
 
 from config import load_settings
 
@@ -167,6 +169,30 @@ def _create_job(url: str) -> dict:
     )
     worker.start()
     return job
+
+
+def _is_api_request() -> bool:
+    return request.path.startswith("/api/")
+
+
+@app.errorhandler(404)
+def handle_not_found(error: NotFound) -> Response | HTTPException:
+    if not _is_api_request():
+        return error
+    response = jsonify({"error": "Resource not found.", "path": request.path})
+    response.status_code = 404
+    return response
+
+
+@app.errorhandler(500)
+def handle_internal_error(error: InternalServerError) -> Response | HTTPException:
+    if not _is_api_request():
+        return error
+    original = getattr(error, "original_exception", None)
+    message = f"Internal server error: {original}" if original is not None else "Internal server error."
+    response = jsonify({"error": message})
+    response.status_code = 500
+    return response
 
 
 @app.get("/")
