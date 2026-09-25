@@ -1,33 +1,33 @@
-# Sprint 3: Bug Bounty Target Radar & Web Dashboard
+# Sprint 3: Public Program Directory & Web Dashboard
 
 ## Objective
 Evolve `api-spec-extractor` into a unified local command center:
-1. **HackerOne Target Radar**: Automated fetcher, cache, and filter engine for active HackerOne bounty programs.
-2. **Interactive Web Dashboard**: Modern Flask web application with a dark theme displaying the radar feed, in-scope web assets, a 1-click scan launcher, and an embedded Swagger UI viewer for generated OpenAPI specifications.
+1. **Public Program Directory**: Automated fetcher, cache, and filter engine for public verified web asset programs.
+2. **Interactive Web Dashboard**: Modern Flask web application with a dark theme displaying the program catalog, in-scope web assets, a 1-click scan launcher, and an embedded Swagger UI viewer for generated OpenAPI specifications.
 
 ## Architecture & Required Modules
 
-### 1. `radar.py` (HackerOne Target Aggregator)
+### 1. `radar.py` (Program Directory Aggregator)
 - Source feed URL:
   `https://raw.githubusercontent.com/arkadiyt/bounty-targets-data/master/data/hackerone_data.json`
-- Function `fetch_or_load_targets(force_refresh: bool = False, cache_path: Path = Path("data/hackerone_targets.json")) -> list[dict]`:
+- Function `fetch_or_load_targets(force_refresh: bool = False, cache_path: Path = Path("data/directory_targets.json")) -> list[dict]`:
   - If cache exists and is less than 24 hours old (and not `force_refresh`), load from local disk.
   - Otherwise, download feed with a timeout, save to `cache_path`, and return parsed JSON.
-- Function `filter_targets(programs: list[dict], min_bounty: float = 0, web_only: bool = True, search_query: str = "") -> list[dict]`:
-  - Filters strictly for `offers_bounties == True` (excludes unpaid VDP).
+- Function `filter_targets(programs: list[dict], min_reward: float = 0, web_only: bool = True, search_query: str = "") -> list[dict]`:
+  - Filters strictly for `offers_bounties == True` (verified reward programs).
   - When `web_only` is true, extracts only in-scope assets where `asset_type in ["URL", "WILDCARD"]`.
   - Filters out out-of-scope assets.
   - Matches program name or handle against `search_query`.
   - Returns structured list of programs with:
-    - `name`, `handle`, `url` (HackerOne link).
-    - `bounty_min`, `bounty_max`, `average_bounty`.
+    - `name`, `handle`, `url`.
+    - `reward_min`, `reward_max`, `average_reward`.
     - `in_scope_domains`: list of clean target URLs/domains.
 
 ### 2. `server.py` (Flask Web Dashboard)
 - Framework: Flask + threading/concurrent worker for background extraction jobs.
 - Endpoints:
   - `GET /`: Main dashboard SPA.
-  - `GET /api/targets`: Returns JSON list of filtered HackerOne targets (accepts `search`, `bounty_min`, `refresh`).
+  - `GET /api/targets`: Returns JSON list of filtered targets (accepts `search`, `min_reward`, `refresh`).
   - `POST /api/scan`: Accepts JSON `{"url": "https://target.com"}`. Spawns an asynchronous extraction task running `main.py` pipeline. Returns `{"job_id": "...", "status": "running"}`.
   - `GET /api/scan/<job_id>`: Returns status (`running`, `completed`, `failed`), logs, and output file locations.
   - `GET /api/openapi/<job_id>`: Serves the generated `openapi.json` for Swagger UI.
@@ -37,9 +37,9 @@ Evolve `api-spec-extractor` into a unified local command center:
 ### 3. Web UI Assets (`templates/` and `static/`)
 - Single Page Application with clean dark theme (Tailwind CSS via CDN, modern typography, Lucide icons via CDN).
 - **Tab 1: Target Radar**:
-  - Search bar + bounty filters.
+  - Search bar + reward filters.
   - Refresh Feed button.
-  - Table of programs with tags, bounty badges, and list of in-scope domains.
+  - Table of programs with tags, reward badges, and list of in-scope domains.
   - Action button on each domain: `[⚡ Scan API]`, which switches to the Scanner tab and begins extraction.
 - **Tab 2: Recon Jobs**:
   - Live list of past and running scans with target URL, date, status, and link to Swagger UI.
@@ -60,4 +60,4 @@ Evolve `api-spec-extractor` into a unified local command center:
 ## Rules & Constraints
 1. English only across all code, HTML, UI text, logs, and schemas.
 2. NO CODE COMMENTS (`#`, `//`, `/* */`).
-3. Clean error handling: If HackerOne feed fails to download or network is offline, load fallback cached data or display clear UI error.
+3. Clean error handling: If the feed fails to download or network is offline, load fallback cached data or display clear UI error.
