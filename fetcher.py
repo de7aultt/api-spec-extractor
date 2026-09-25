@@ -1,7 +1,8 @@
 import hashlib
+import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urldefrag, urljoin, urlparse
 
@@ -41,6 +42,19 @@ TRACKER_PATTERNS = (
 
 MAX_FILENAME_STEM_LENGTH = 80
 DEFAULT_DOWNLOAD_WORKERS = 6
+MANIFEST_CANDIDATE_PATHS = (
+    "/build/manifest.json",
+    "/.vite/manifest.json",
+    "/build/.vite/manifest.json",
+    "/manifest.json",
+)
+SCRIPT_ASSET_SUFFIXES = (".js", ".mjs")
+INLINE_SCRIPTS_FILENAME = "inline_scripts.js"
+JSON_SCRIPT_TYPES = frozenset({"application/json", "application/ld+json", "importmap", "speculationrules"})
+NON_SCRIPT_TYPES = frozenset({"text/template", "text/x-template", "text/html", "text/css", "text/plain"})
+INLINE_MODULE_IMPORT_PATTERN = re.compile(
+    r"""(?:\bimport\s*(?:[\w$*{},\s]+\s*from\s*)?|\bimport\s*\(\s*)(['"`])(?P<path>[^'"`\s]+?\.m?js(?:\?[^'"`\s]*)?)\1"""
+)
 
 
 class FetchError(RuntimeError):
@@ -171,3 +185,191 @@ def download_scripts(
             if on_complete is not None:
                 on_complete(result)
     return [results[url] for url in urls]
+
+
+@dataclass(frozen=True)
+class ManifestDiscovery:
+    manifest_url: str
+    manifest_path: str
+    bundler: str
+    chunk_urls: list[str] = field(default_factory=list)
+    entry_urls: list[str] = field(default_factory=list)
+
+    @property
+    def chunk_count(self) -> int:
+        return len(self.chunk_urls)
+
+
+@dataclass(frozen=True)
+class InlineScript:
+    index: int
+    content: str
+    script_type: str
+    element_id: str | None
+
+    @property
+    def is_json(self) -> bool:
+        return self.script_type in JSON_SCRIPT_TYPES or self.script_type.endswith("+json")
+
+
+def _origin(url: str) -> str:
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _manifest_asset_base(manifest_url: str) -> str:
+    directory_url = urljoin(manifest_url, ".")
+    if directory_url.rstrip("/").endswith("/.vite"):
+        return urljoin(directory_url, "..")
+    return directory_url
+
+
+def _is_script_asset(path: str) -> bool:
+    return urlparse(path).path.lower().endswith(SCRIPT_ASSET_SUFFIXES)
+
+
+def parse_vite_manifest(payload: object, manifest_url: str) -> ManifestDiscovery | None:
+    if not isinstance(payload, dict) or not payload:
+        return None
+    entries = [entry for entry in payload.values() if isinstance(entry, dict) and isinstance(entry.get("file"), str)]
+    if not entries:
+        return None
+    asset_base = _manifest_asset_base(manifest_url)
+    ordered_entries = sorted(entries, key=lambda entry: (not entry.get("isEntry", False), entry.get("isDynamicEntry", False)))
+    chunk_urls: list[str] = []
+    entry_urls: list[str] = []
+    for entry in ordered_entries:
+        file_path = entry["file"].lstrip("/")
+        if not _is_script_asset(file_path):
+            continue
+        absolute_url = urljoin(asset_base, file_path)
+        if absolute_url in chunk_urls:
+            continue
+        chunk_urls.append(absolute_url)
+        if entry.get("isEntry"):
+            entry_urls.append(absolute_url)
+    if not chunk_urls:
+        return None
+    return ManifestDiscovery(
+        manifest_url=manifest_url,
+        manifest_path=urlparse(manifest_url).path,
+        bundler="Vite",
+        chunk_urls=chunk_urls,
+        entry_urls=entry_urls,
+    )
+
+
+def discover_manifests(
+    base_url: str,
+    timeout: float = DEFAULT_REQUEST_TIMEOUT,
+    candidate_paths: tuple[str, ...] = MANIFEST_CANDIDATE_PATHS,
+) -> list[ManifestDiscovery]:
+    roots = (urljoin(base_url, "./"), f"{_origin(base_url)}/")
+    candidate_urls: list[str] = []
+    for candidate_path in candidate_paths:
+        for root in roots:
+            candidate_url = urljoin(root, candidate_path.lstrip("/"))
+            if candidate_url not in candidate_urls:
+                candidate_urls.append(candidate_url)
+    discoveries: list[ManifestDiscovery] = []
+    known_chunks: set[str] = set()
+    for candidate_url in candidate_urls:
+        try:
+            response = _get(candidate_url, timeout)
+            payload = json.loads(response.text)
+        except (FetchError, ValueError):
+            continue
+        discovery = parse_vite_manifest(payload, candidate_url)
+        if discovery is None or set(discovery.chunk_urls) <= known_chunks:
+            continue
+        known_chunks.update(discovery.chunk_urls)
+        discoveries.append(discovery)
+    return discoveries
+
+
+def extract_preload_urls(html: str, base_url: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    discovered: list[str] = []
+    for link_tag in soup.find_all("link", href=True):
+        relations = {relation.lower() for relation in (link_tag.get("rel") or [])}
+        is_module_preload = "modulepreload" in relations
+        is_script_preload = "preload" in relations and (link_tag.get("as") or "").lower() == "script"
+        if not (is_module_preload or is_script_preload):
+            continue
+        absolute_url, _ = urldefrag(urljoin(base_url, link_tag["href"].strip()))
+        if urlparse(absolute_url).scheme in {"http", "https"} and not is_tracker_script(absolute_url):
+            if absolute_url not in discovered:
+                discovered.append(absolute_url)
+    return discovered
+
+
+def extract_inline_scripts(html: str) -> list[InlineScript]:
+    soup = BeautifulSoup(html, "html.parser")
+    scripts: list[InlineScript] = []
+    for script_tag in soup.find_all("script"):
+        if script_tag.get("src"):
+            continue
+        script_type = (script_tag.get("type") or "text/javascript").strip().lower()
+        if script_type in NON_SCRIPT_TYPES:
+            continue
+        content = (script_tag.string or script_tag.get_text() or "").strip()
+        if not content:
+            continue
+        scripts.append(
+            InlineScript(
+                index=len(scripts) + 1,
+                content=content,
+                script_type=script_type,
+                element_id=script_tag.get("id"),
+            )
+        )
+    return scripts
+
+
+def extract_inline_module_imports(inline_scripts: list[InlineScript], base_url: str) -> list[str]:
+    discovered: list[str] = []
+    for script in inline_scripts:
+        if script.is_json:
+            continue
+        for match in INLINE_MODULE_IMPORT_PATTERN.finditer(script.content):
+            absolute_url, _ = urldefrag(urljoin(base_url, match.group("path")))
+            if urlparse(absolute_url).scheme not in {"http", "https"} or is_tracker_script(absolute_url):
+                continue
+            if absolute_url not in discovered:
+                discovered.append(absolute_url)
+    return discovered
+
+
+def render_inline_scripts(inline_scripts: list[InlineScript]) -> str:
+    rendered_parts = []
+    for script in inline_scripts:
+        body = script.content if script.is_json else beautify_script(script.content)
+        if script.is_json:
+            label = script.element_id or f"inline_json_{script.index}"
+            safe_label = re.sub(r"[^A-Za-z0-9_$]", "_", label)
+            body = f"const {safe_label} = {body};"
+        rendered_parts.append(body.rstrip().rstrip(";") + ";")
+    return "\n\n".join(rendered_parts) + "\n"
+
+
+def save_inline_scripts(inline_scripts: list[InlineScript], output_dir: Path) -> Path | None:
+    if not inline_scripts:
+        return None
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        target_path = output_dir / INLINE_SCRIPTS_FILENAME
+        target_path.write_text(render_inline_scripts(inline_scripts), encoding="utf-8")
+    except OSError as error:
+        raise FetchError(f"Unable to save inline scripts: {error}") from error
+    return target_path
+
+
+def prioritize_script_urls(url_groups: list[list[str]], max_scripts: int) -> tuple[list[str], int]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for group in url_groups:
+        for url in group:
+            if url not in seen:
+                seen.add(url)
+                ordered.append(url)
+    return ordered[:max_scripts], len(ordered)

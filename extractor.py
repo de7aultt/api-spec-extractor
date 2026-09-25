@@ -1,6 +1,9 @@
+import json
 import re
 from dataclasses import dataclass, field
 from urllib.parse import parse_qsl, urlparse
+
+from bs4 import BeautifulSoup
 
 HTTP_METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH")
 
@@ -78,6 +81,8 @@ class ScriptAnalysis:
     endpoints: list[dict] = field(default_factory=list)
     state_models: list[str] = field(default_factory=list)
     code_blocks: list[str] = field(default_factory=list)
+    ziggy_routes: list[dict] = field(default_factory=list)
+    route_calls: list[dict] = field(default_factory=list)
 
 
 def _parameter_name_from_expression(expression: str) -> str:
@@ -188,6 +193,8 @@ def merge_endpoints(endpoint_groups: list[list[dict]]) -> list[dict]:
                     "path_params": list(endpoint["path_params"]),
                     "lines": list(endpoint["lines"]),
                     "samples": list(endpoint["samples"]),
+                    "route_names": list(endpoint.get("route_names", [])),
+                    "sources": list(endpoint.get("sources", [])),
                 }
                 continue
             if existing["method_inferred"] and not endpoint["method_inferred"]:
@@ -206,6 +213,10 @@ def merge_endpoints(endpoint_groups: list[list[dict]]) -> list[dict]:
             for sample in endpoint["samples"]:
                 if len(existing["samples"]) < MAX_SAMPLES_PER_ENDPOINT and sample not in existing["samples"]:
                     existing["samples"].append(sample)
+            for key in ("route_names", "sources"):
+                for value in endpoint.get(key, []):
+                    if value not in existing[key]:
+                        existing[key].append(value)
     return sorted(merged.values(), key=lambda item: item["path"])
 
 
@@ -397,4 +408,466 @@ def analyze_script(content: str, source: str, max_chars_per_block: int = 4000) -
         endpoints=extract_endpoints(content),
         state_models=extract_state_models(content),
         code_blocks=extract_candidate_code_blocks(content, max_chars_per_block),
+        ziggy_routes=extract_ziggy_routes(content),
+        route_calls=extract_route_calls(content),
     )
+
+
+ZIGGY_ASSIGNMENT_PATTERN = re.compile(r"\bZiggy\s*=\s*(?=\{|JSON\.parse\s*\()")
+ZIGGY_SHAPE_PATTERN = re.compile(r"\{\s*['\"]?url['\"]?\s*:\s*[^,{}]{1,300},\s*['\"]?port['\"]?\s*:")
+JSON_PARSE_CALL_PATTERN = re.compile(r"JSON\.parse\s*\(\s*(?=['\"`])")
+ROUTE_CALL_PATTERN = re.compile(r"(?<![\w$])(?:\$?route)\s*\(\s*(['\"`])(?P<name>[\w.\-:/]+)\1")
+ZIGGY_PARAMETER_PATTERN = re.compile(r"\{(?P<name>[A-Za-z_][\w]*)\??\}")
+NEXT_DYNAMIC_SEGMENT_PATTERN = re.compile(r"\[(?:\.\.\.)?(?P<name>[A-Za-z_][\w]*)\]")
+JS_IDENTIFIER_START = re.compile(r"[A-Za-z_$]")
+JS_IDENTIFIER_BODY = re.compile(r"[\w$]*")
+JS_NUMBER_PATTERN = re.compile(r"-?(?:0[xX][0-9a-fA-F]+|(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)")
+JS_KEYWORD_VALUES = {"true": "true", "false": "false", "null": "null", "undefined": "null", "NaN": "null", "Infinity": "null"}
+JS_SIMPLE_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "v": "\v", "0": "\0"}
+MAX_STATE_MODEL_DEPTH = 3
+MAX_ZIGGY_SCAN_CHARS = 2_000_000
+
+
+class JavaScriptLiteralError(ValueError):
+    pass
+
+
+@dataclass
+class FrameworkDetection:
+    framework: str
+    detail: str
+    route_count: int = 0
+    source: str = ""
+
+    def as_dict(self) -> dict:
+        return {
+            "framework": self.framework,
+            "detail": self.detail,
+            "route_count": self.route_count,
+            "source": self.source,
+        }
+
+
+@dataclass
+class DocumentAnalysis:
+    source: str
+    ziggy_routes: list[dict] = field(default_factory=list)
+    inertia_page: dict | None = None
+    next_data: dict | None = None
+    endpoints: list[dict] = field(default_factory=list)
+    state_models: list[str] = field(default_factory=list)
+    detections: list[FrameworkDetection] = field(default_factory=list)
+
+
+def _decode_js_string(content: str, index: int) -> tuple[str, int]:
+    quote = content[index]
+    position = index + 1
+    characters: list[str] = []
+    length = len(content)
+    while position < length:
+        character = content[position]
+        if character == quote:
+            return "".join(characters), position + 1
+        if quote == "`" and content.startswith("${", position):
+            raise JavaScriptLiteralError("Template literal interpolation is not a static value")
+        if character != "\\":
+            characters.append(character)
+            position += 1
+            continue
+        position += 1
+        if position >= length:
+            break
+        escape = content[position]
+        if escape in JS_SIMPLE_ESCAPES and not (escape == "0" and content[position + 1:position + 2].isdigit()):
+            characters.append(JS_SIMPLE_ESCAPES[escape])
+            position += 1
+        elif escape == "x":
+            characters.append(chr(int(content[position + 1:position + 3], 16)))
+            position += 3
+        elif escape == "u" and content.startswith("{", position + 1):
+            closing = content.index("}", position)
+            characters.append(chr(int(content[position + 2:closing], 16)))
+            position = closing + 1
+        elif escape == "u":
+            characters.append(chr(int(content[position + 1:position + 5], 16)))
+            position += 5
+        elif escape in "\r\n":
+            position += 2 if content.startswith("\r\n", position) else 1
+        else:
+            characters.append(escape)
+            position += 1
+    raise JavaScriptLiteralError("Unterminated string literal")
+
+
+def _next_significant_character(content: str, index: int) -> str:
+    position = index
+    length = len(content)
+    while position < length:
+        if content[position].isspace():
+            position += 1
+            continue
+        if content.startswith("//", position) or content.startswith("/*", position):
+            position = _skip_comment(content, position)
+            continue
+        return content[position]
+    return ""
+
+
+def _drop_trailing_comma(parts: list[str]) -> None:
+    while parts and parts[-1].isspace():
+        parts.pop()
+    if parts and parts[-1] == ",":
+        parts.pop()
+
+
+def javascript_literal_to_json(literal: str) -> str:
+    parts: list[str] = []
+    position = 0
+    length = len(literal)
+    while position < length:
+        character = literal[position]
+        if character.isspace():
+            position += 1
+            continue
+        if literal.startswith("//", position) or literal.startswith("/*", position):
+            position = _skip_comment(literal, position)
+            continue
+        if character in "'\"`":
+            try:
+                value, position = _decode_js_string(literal, position)
+            except (ValueError, IndexError) as error:
+                raise JavaScriptLiteralError(f"Invalid string literal: {error}") from error
+            parts.append(json.dumps(value))
+            continue
+        if character in "}]":
+            _drop_trailing_comma(parts)
+            parts.append(character)
+            position += 1
+            continue
+        if character in "{[:,":
+            parts.append(character)
+            position += 1
+            continue
+        if literal.startswith("!0", position) or literal.startswith("!1", position):
+            parts.append("true" if literal[position + 1] == "0" else "false")
+            position += 2
+            continue
+        if literal.startswith("void 0", position):
+            parts.append("null")
+            position += 6
+            continue
+        number_match = JS_NUMBER_PATTERN.match(literal, position)
+        if number_match and (character.isdigit() or character in "-."):
+            token = number_match.group()
+            is_key = _next_significant_character(literal, number_match.end()) == ":"
+            if is_key:
+                parts.append(json.dumps(token))
+            elif token.lower().lstrip("-").startswith("0x"):
+                parts.append(str(int(token, 16)))
+            else:
+                normalized = token.replace("-.", "-0.")
+                parts.append("0" + normalized if normalized.startswith(".") else normalized)
+            position = number_match.end()
+            continue
+        if JS_IDENTIFIER_START.match(character):
+            identifier_end = JS_IDENTIFIER_BODY.match(literal, position + 1).end()
+            identifier = literal[position:identifier_end]
+            if _next_significant_character(literal, identifier_end) == ":":
+                parts.append(json.dumps(identifier))
+            elif identifier in JS_KEYWORD_VALUES:
+                parts.append(JS_KEYWORD_VALUES[identifier])
+            else:
+                raise JavaScriptLiteralError(f"Unsupported identifier '{identifier}' in literal")
+            position = identifier_end
+            continue
+        raise JavaScriptLiteralError(f"Unexpected character '{character}' at position {position}")
+    return "".join(parts)
+
+
+def parse_javascript_literal(literal: str) -> object:
+    try:
+        return json.loads(literal)
+    except ValueError:
+        pass
+    try:
+        return json.loads(javascript_literal_to_json(literal))
+    except ValueError as error:
+        raise JavaScriptLiteralError(f"Unable to parse JavaScript literal: {error}") from error
+
+
+def _read_object_literal(content: str, index: int) -> object | None:
+    if content.startswith("{", index):
+        close_index = find_matching_brace(content, index)
+        if close_index == -1:
+            return None
+        literal = content[index:close_index + 1]
+    else:
+        call_match = JSON_PARSE_CALL_PATTERN.match(content, index)
+        if not call_match:
+            return None
+        try:
+            literal, _ = _decode_js_string(content, call_match.end())
+        except (ValueError, IndexError):
+            return None
+    try:
+        return parse_javascript_literal(literal)
+    except JavaScriptLiteralError:
+        return None
+
+
+def _is_ziggy_config(candidate: object) -> bool:
+    if not isinstance(candidate, dict):
+        return False
+    routes = candidate.get("routes")
+    return isinstance(routes, dict) and bool(routes) and all(
+        isinstance(route, dict) and isinstance(route.get("uri"), str) for route in routes.values()
+    )
+
+
+def normalize_ziggy_uri(uri: str, base_url: str | None = None) -> str:
+    prefix = ""
+    if base_url:
+        prefix = urlparse(base_url).path.rstrip("/")
+    cleaned = ZIGGY_PARAMETER_PATTERN.sub(lambda match: "{" + match.group("name") + "}", uri.strip())
+    cleaned = "/" + cleaned.strip("/")
+    combined = f"{prefix}{cleaned}" if cleaned != "/" else (prefix or "/")
+    return re.sub(r"/{2,}", "/", combined)
+
+
+def ziggy_config_to_routes(config: dict) -> list[dict]:
+    if not _is_ziggy_config(config):
+        return []
+    base_url = config.get("url") if isinstance(config.get("url"), str) else None
+    routes: list[dict] = []
+    for name, definition in config["routes"].items():
+        raw_methods = definition.get("methods") or ["GET"]
+        methods = [method for method in HTTP_METHODS if method in {str(item).upper() for item in raw_methods}]
+        uri = definition["uri"]
+        routes.append({
+            "name": str(name),
+            "uri": uri,
+            "path": normalize_ziggy_uri(uri, base_url),
+            "methods": methods or ["GET"],
+            "parameters": ZIGGY_PARAMETER_PATTERN.findall(uri),
+            "optional_parameters": re.findall(r"\{([A-Za-z_][\w]*)\?\}", uri),
+            "domain": definition.get("domain"),
+            "wheres": definition.get("wheres") if isinstance(definition.get("wheres"), dict) else {},
+        })
+    return routes
+
+
+def _merge_ziggy_routes(route_groups: list[list[dict]]) -> list[dict]:
+    merged: dict[str, dict] = {}
+    for group in route_groups:
+        for route in group:
+            merged.setdefault(route["name"], route)
+    return sorted(merged.values(), key=lambda route: (route["path"], route["name"]))
+
+
+def extract_ziggy_routes(content: str) -> list[dict]:
+    scan_region = content[:MAX_ZIGGY_SCAN_CHARS]
+    candidate_indices = sorted(
+        {match.end() for match in ZIGGY_ASSIGNMENT_PATTERN.finditer(scan_region)}
+        | {match.start() for match in ZIGGY_SHAPE_PATTERN.finditer(scan_region)}
+    )
+    route_groups: list[list[dict]] = []
+    consumed_until = -1
+    for index in candidate_indices:
+        if index < consumed_until:
+            continue
+        config = _read_object_literal(content, index)
+        if not _is_ziggy_config(config):
+            continue
+        route_groups.append(ziggy_config_to_routes(config))
+        if content.startswith("{", index):
+            consumed_until = find_matching_brace(content, index)
+    return _merge_ziggy_routes(route_groups)
+
+
+def extract_route_calls(content: str) -> list[dict]:
+    calls: list[dict] = []
+    for match in ROUTE_CALL_PATTERN.finditer(content):
+        lookback = content[max(0, match.start() - METHOD_LOOKBACK_CHARS):match.start()]
+        client_call = CLIENT_METHOD_CALL_PATTERN.search(lookback)
+        calls.append({
+            "name": match.group("name"),
+            "method": client_call.group("method").upper() if client_call else None,
+            "line": content.count("\n", 0, match.start()) + 1,
+        })
+    return calls
+
+
+def ziggy_routes_to_endpoints(routes: list[dict], source: str = "ziggy") -> list[dict]:
+    endpoints: list[dict] = []
+    for route in routes:
+        endpoints.append({
+            "path": route["path"],
+            "methods": list(route["methods"]),
+            "query_params": [],
+            "path_params": re.findall(r"\{([^{}]+)\}", route["path"]),
+            "occurrences": 1,
+            "lines": [],
+            "samples": [route["uri"]],
+            "method_inferred": False,
+            "route_names": [route["name"]],
+            "sources": [source],
+        })
+    return merge_endpoints([endpoints])
+
+
+def resolve_route_calls(calls: list[dict], routes: list[dict]) -> tuple[list[dict], list[str]]:
+    routes_by_name = {route["name"]: route for route in routes}
+    endpoints: list[dict] = []
+    unresolved: list[str] = []
+    for call in calls:
+        route = routes_by_name.get(call["name"])
+        if route is None:
+            if call["name"] not in unresolved:
+                unresolved.append(call["name"])
+            continue
+        methods = [call["method"]] if call["method"] else list(route["methods"])
+        endpoints.append({
+            "path": route["path"],
+            "methods": methods,
+            "query_params": [],
+            "path_params": re.findall(r"\{([^{}]+)\}", route["path"]),
+            "occurrences": 1,
+            "lines": [call["line"]],
+            "samples": [f"route('{call['name']}')"],
+            "method_inferred": False,
+            "route_names": [route["name"]],
+            "sources": ["route-call"],
+        })
+    return merge_endpoints([endpoints]), unresolved
+
+
+def _collect_state_paths(value: object, prefix: str, depth: int, collected: set[str]) -> None:
+    if not isinstance(value, dict) or depth > MAX_STATE_MODEL_DEPTH:
+        return
+    for key, nested in value.items():
+        path = f"{prefix}.{key}"
+        collected.add(path)
+        _collect_state_paths(nested, path, depth + 1, collected)
+
+
+def _endpoints_from_data(value: object, source: str) -> list[dict]:
+    serialized = json.dumps(value, ensure_ascii=False)
+    endpoints = extract_endpoints(serialized)
+    for endpoint in endpoints:
+        endpoint["lines"] = []
+        endpoint["route_names"] = []
+        endpoint["sources"] = [source]
+    return endpoints
+
+
+def extract_inertia_page(html: str) -> dict | None:
+    soup = BeautifulSoup(html, "html.parser")
+    for element in soup.find_all(attrs={"data-page": True}):
+        attribute_value = (element.get("data-page") or "").strip()
+        raw_payload = attribute_value if attribute_value.startswith("{") else (element.string or element.get_text() or "").strip()
+        if not raw_payload.startswith("{"):
+            continue
+        try:
+            payload = json.loads(raw_payload)
+        except ValueError:
+            continue
+        if isinstance(payload, dict) and ("component" in payload or "props" in payload):
+            return payload
+    return None
+
+
+def extract_next_data(html: str) -> dict | None:
+    soup = BeautifulSoup(html, "html.parser")
+    script_tag = soup.find("script", id="__NEXT_DATA__")
+    if script_tag is None:
+        return None
+    try:
+        payload = json.loads(script_tag.string or script_tag.get_text() or "")
+    except ValueError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def next_data_route(next_data: dict) -> str | None:
+    build_id = next_data.get("buildId")
+    page = next_data.get("page")
+    if not isinstance(build_id, str) or not isinstance(page, str):
+        return None
+    normalized_page = NEXT_DYNAMIC_SEGMENT_PATTERN.sub(lambda match: "{" + match.group("name") + "}", page)
+    page_segment = "/index" if normalized_page in {"", "/"} else normalized_page
+    return f"/_next/data/{build_id}{page_segment}.json"
+
+
+def analyze_html_document(html: str, source: str) -> DocumentAnalysis:
+    analysis = DocumentAnalysis(source=source)
+    endpoint_groups: list[list[dict]] = []
+    state_models: set[str] = set()
+    html_routes = extract_ziggy_routes(html)
+    if html_routes:
+        analysis.detections.append(FrameworkDetection(
+            framework="Laravel Ziggy",
+            detail=f"{len(html_routes)} routes in HTML",
+            route_count=len(html_routes),
+            source=source,
+        ))
+    route_groups = [html_routes]
+    inertia_page = extract_inertia_page(html)
+    if inertia_page is not None:
+        analysis.inertia_page = inertia_page
+        props = inertia_page.get("props") if isinstance(inertia_page.get("props"), dict) else {}
+        props_without_ziggy = {key: value for key, value in props.items() if key != "ziggy"}
+        _collect_state_paths(props_without_ziggy, "inertia.props", 1, state_models)
+        shared_ziggy = props.get("ziggy")
+        props_routes = ziggy_config_to_routes(shared_ziggy) if isinstance(shared_ziggy, dict) else []
+        if props_routes:
+            route_groups.append(props_routes)
+            analysis.detections.append(FrameworkDetection(
+                framework="Laravel Ziggy",
+                detail=f"{len(props_routes)} routes in Inertia props",
+                route_count=len(props_routes),
+                source=source,
+            ))
+        endpoint_groups.append(_endpoints_from_data(props_without_ziggy, "inertia-props"))
+        component = inertia_page.get("component") or "unknown component"
+        analysis.detections.append(FrameworkDetection(
+            framework="Inertia.js",
+            detail=f"page component '{component}' with {len(props)} props",
+            source=source,
+        ))
+    next_data = extract_next_data(html)
+    if next_data is not None:
+        analysis.next_data = next_data
+        page_props = next_data.get("props", {}).get("pageProps") if isinstance(next_data.get("props"), dict) else None
+        _collect_state_paths(page_props, "next.pageProps", 1, state_models)
+        endpoint_groups.append(_endpoints_from_data(next_data.get("props", {}), "next-data"))
+        data_route = next_data_route(next_data)
+        next_endpoints: list[dict] = []
+        if data_route:
+            next_endpoints.append({
+                "path": data_route,
+                "methods": ["GET"],
+                "query_params": [],
+                "path_params": re.findall(r"\{([^{}]+)\}", data_route),
+                "occurrences": 1,
+                "lines": [],
+                "samples": [data_route],
+                "method_inferred": False,
+                "route_names": [str(next_data.get("page"))],
+                "sources": ["next-data"],
+            })
+            endpoint_groups.append(next_endpoints)
+        analysis.detections.append(FrameworkDetection(
+            framework="Next.js",
+            detail=f"page '{next_data.get('page', 'unknown')}' (build {next_data.get('buildId', 'unknown')})",
+            route_count=len(next_endpoints),
+            source=source,
+        ))
+    analysis.ziggy_routes = _merge_ziggy_routes(route_groups)
+    endpoint_groups.append(ziggy_routes_to_endpoints(analysis.ziggy_routes))
+    analysis.endpoints = merge_endpoints(endpoint_groups)
+    analysis.state_models = sorted(state_models)
+    return analysis
+
+
+def combine_ziggy_routes(route_groups: list[list[dict]]) -> list[dict]:
+    return _merge_ziggy_routes(route_groups)

@@ -7,3 +7,4 @@ downloads/
 .idea/
 .vscode/
 output/
+.pytest_cache/
