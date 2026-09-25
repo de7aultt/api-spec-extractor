@@ -218,10 +218,21 @@ def index() -> str:
 
 @app.get("/api/targets")
 def api_targets() -> Response:
-    from radar import RadarError, fetch_or_load_targets, filter_targets
+    from radar import (
+        RadarError,
+        enrich_targets,
+        fetch_or_load_targets,
+        filter_by_tier,
+        filter_targets,
+        sort_targets,
+    )
 
     search_query = request.args.get("search", "", type=str)
     refresh = request.args.get("refresh", "false", type=str).lower() in {"1", "true", "yes"}
+    tier_filter = request.args.get("tier", "", type=str)
+    sort_by = request.args.get("sort_by", "opportunity", type=str).strip().lower()
+    if sort_by not in {"opportunity", "response", "name"}:
+        sort_by = "opportunity"
     try:
         min_bounty = float(request.args.get("bounty_min", "0", type=str) or 0)
     except ValueError:
@@ -241,7 +252,20 @@ def api_targets() -> Response:
         search_query=search_query,
         min_response_rate=min_response,
     )
-    return jsonify({"count": len(targets), "targets": targets})
+    targets = enrich_targets(targets)
+    top_recommendation = sort_targets(targets, "opportunity")[0] if targets else None
+    if tier_filter:
+        targets = filter_by_tier(targets, tier_filter)
+    targets = sort_targets(targets, sort_by)
+    return jsonify(
+        {
+            "count": len(targets),
+            "targets": targets,
+            "top_recommendation": top_recommendation,
+            "sort_by": sort_by,
+            "tier": tier_filter.strip().upper(),
+        }
+    )
 
 
 @app.post("/api/scan")

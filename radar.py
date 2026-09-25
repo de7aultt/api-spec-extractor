@@ -1,5 +1,6 @@
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
@@ -164,6 +165,7 @@ def filter_targets(
         if min_bounty > 0 and maximum < min_bounty:
             continue
         program_url = str(program.get("url", "")).strip() or f"https://hackerone.com/{handle}"
+        has_wildcard = any("*" in domain for domain in domains)
         results.append(
             {
                 "name": name or handle,
@@ -174,6 +176,192 @@ def filter_targets(
                 "average_bounty": average,
                 "response_efficiency": response_rate,
                 "in_scope_domains": domains,
+                "has_wildcard": has_wildcard,
+                "domain_count": len(domains),
+                "managed_program": bool(program.get("managed_program")),
+                "average_time_to_first_program_response": _coerce_float(
+                    program.get("average_time_to_first_program_response")
+                ),
             }
         )
     return results
+
+
+ENRICHMENT_CACHE_PATH = Path("data/hackerone_enriched.json")
+ENRICHMENT_WORKERS = 8
+RESPONSE_EFFICIENCY_WEIGHT = 35
+LOW_COMPETITION_POINTS = 25
+MEDIUM_COMPETITION_POINTS = 15
+ELEVATED_COMPETITION_POINTS = 10
+HIGH_COMPETITION_POINTS = 5
+WILDCARD_POINTS = 15
+DOMAIN_BREADTH_POINTS = 5
+MANAGED_PROGRAM_POINTS = 10
+RESOLVED_REPORTS_POINTS = 10
+DOMAIN_BREADTH_THRESHOLD = 5
+LOW_COMPETITION_LIMIT = 100
+MEDIUM_COMPETITION_LIMIT = 300
+HIGH_COMPETITION_LIMIT = 500
+
+
+def _competition_points(researcher_count: int) -> int:
+    if researcher_count <= 0:
+        return LOW_COMPETITION_POINTS
+    if researcher_count < LOW_COMPETITION_LIMIT:
+        return LOW_COMPETITION_POINTS
+    if researcher_count <= MEDIUM_COMPETITION_LIMIT:
+        return MEDIUM_COMPETITION_POINTS
+    if researcher_count <= HIGH_COMPETITION_LIMIT:
+        return ELEVATED_COMPETITION_POINTS
+    return HIGH_COMPETITION_POINTS
+
+
+def _tier_for_score(score: int) -> str:
+    if score >= 85:
+        return "S"
+    if score >= 70:
+        return "A"
+    if score >= 50:
+        return "B"
+    return "C"
+
+
+def _has_wildcard(program: dict) -> bool:
+    if program.get("has_wildcard"):
+        return True
+    for domain in program.get("in_scope_domains") or []:
+        if "*" in str(domain):
+            return True
+    return False
+
+
+def calculate_opportunity_score(program: dict) -> dict:
+    response_rate = _coerce_float(
+        program.get("response_efficiency")
+        or program.get("response_efficiency_percentage")
+    )
+    researcher_count = int(_coerce_float(program.get("researcher_count")))
+    resolved_reports = int(_coerce_float(program.get("resolved_report_count")))
+    managed_program = bool(program.get("managed_program"))
+    domains = program.get("in_scope_domains") or []
+    domain_count = len(domains)
+    wildcard_present = _has_wildcard(program)
+
+    response_points = round(min(response_rate, 100.0) / 100.0 * RESPONSE_EFFICIENCY_WEIGHT)
+    competition_points = _competition_points(researcher_count)
+    scope_points = (WILDCARD_POINTS if wildcard_present else 0)
+    if domain_count >= DOMAIN_BREADTH_THRESHOLD:
+        scope_points += DOMAIN_BREADTH_POINTS
+    quality_points = (MANAGED_PROGRAM_POINTS if managed_program else 0)
+    if resolved_reports > 0:
+        quality_points += RESOLVED_REPORTS_POINTS
+
+    score = max(0, min(100, response_points + competition_points + scope_points + quality_points))
+    tier = _tier_for_score(score)
+
+    highlights: list[str] = []
+    if response_rate > 0:
+        highlights.append(f"{round(response_rate)}% response efficiency")
+    if researcher_count and researcher_count < LOW_COMPETITION_LIMIT:
+        highlights.append("low researcher competition")
+    elif researcher_count > HIGH_COMPETITION_LIMIT:
+        highlights.append("crowded program")
+    if wildcard_present:
+        highlights.append("wildcard scope")
+    elif domain_count >= DOMAIN_BREADTH_THRESHOLD:
+        highlights.append(f"{domain_count} in-scope domains")
+    if managed_program:
+        highlights.append("HackerOne managed triage")
+    if resolved_reports > 0:
+        highlights.append(f"{resolved_reports} resolved reports")
+
+    reason = f"Tier {tier} ({score}/100): " + (", ".join(highlights) if highlights else "limited public signal")
+
+    return {
+        "score": score,
+        "tier": tier,
+        "recommendation_reason": reason,
+    }
+
+
+def _load_enrichment_cache(cache_path: Path) -> dict:
+    cache_path = Path(cache_path)
+    if not cache_path.exists():
+        return {}
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def _save_enrichment_cache(cache_path: Path, data: dict) -> None:
+    cache_path = Path(cache_path)
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    except OSError:
+        return
+
+
+def _derive_enrichment(target: dict, cached: dict) -> dict:
+    researcher_count = int(_coerce_float(cached.get("researcher_count")))
+    resolved_reports = int(_coerce_float(cached.get("resolved_report_count")))
+    time_to_first_response = _coerce_float(
+        cached.get("time_to_first_response")
+        or target.get("average_time_to_first_program_response")
+    )
+    managed_program = bool(cached.get("managed_program", target.get("managed_program", False)))
+    return {
+        "researcher_count": researcher_count,
+        "resolved_report_count": resolved_reports,
+        "time_to_first_response": time_to_first_response,
+        "managed_program": managed_program,
+    }
+
+
+def enrich_target(target: dict, cache: dict) -> dict:
+    cached = cache.get(target.get("handle", ""), {})
+    if not isinstance(cached, dict):
+        cached = {}
+    enrichment = _derive_enrichment(target, cached)
+    enriched = dict(target)
+    enriched.update(enrichment)
+    scoring = calculate_opportunity_score(enriched)
+    enriched["opportunity_score"] = scoring["score"]
+    enriched["tier"] = scoring["tier"]
+    enriched["recommendation_reason"] = scoring["recommendation_reason"]
+    return enriched
+
+
+def enrich_targets(targets: list[dict], cache_path: Path = ENRICHMENT_CACHE_PATH) -> list[dict]:
+    if not targets:
+        return []
+    cache = _load_enrichment_cache(cache_path)
+    enriched: list[dict] = [{} for _ in targets]
+    with ThreadPoolExecutor(max_workers=ENRICHMENT_WORKERS) as executor:
+        future_to_index = {
+            executor.submit(enrich_target, target, cache): index
+            for index, target in enumerate(targets)
+        }
+        for future in as_completed(future_to_index):
+            index = future_to_index[future]
+            enriched[index] = future.result()
+    return enriched
+
+
+def sort_targets(targets: list[dict], sort_by: str = "opportunity") -> list[dict]:
+    if sort_by == "response":
+        return sorted(targets, key=lambda item: _coerce_float(item.get("response_efficiency")), reverse=True)
+    if sort_by == "name":
+        return sorted(targets, key=lambda item: str(item.get("name", "")).lower())
+    return sorted(targets, key=lambda item: item.get("opportunity_score", 0), reverse=True)
+
+
+def filter_by_tier(targets: list[dict], tier: str) -> list[dict]:
+    normalized = (tier or "").strip().upper()
+    if normalized not in {"S", "A", "B", "C"}:
+        return targets
+    return [target for target in targets if target.get("tier") == normalized]

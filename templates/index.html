@@ -6,6 +6,9 @@
   <title>API Spec Extractor Command Center</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/lucide@latest"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}" />
   <script>
     tailwind.config = {
@@ -13,11 +16,13 @@
       theme: {
         extend: {
           colors: {
-            surface: "#0b0f17",
-            panel: "#131a26",
-            edge: "#1f2a3a",
+            surface: "#05060a",
+            panel: "#0d1220",
+            edge: "#1b2333",
             accent: "#38bdf8",
-            accent2: "#a78bfa"
+            accent2: "#a78bfa",
+            emerald: "#34d399",
+            amber: "#fbbf24"
           },
           fontFamily: {
             sans: ["Inter", "ui-sans-serif", "system-ui", "sans-serif"],
@@ -29,63 +34,95 @@
   </script>
 </head>
 <body class="bg-surface text-slate-200 font-sans min-h-screen">
-  <header class="border-b border-edge bg-panel/60 backdrop-blur sticky top-0 z-20">
-    <div class="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
+  <div class="glow-backdrop"></div>
+
+  <header class="border-b border-edge/70 bg-panel/50 backdrop-blur-xl sticky top-0 z-20">
+    <div class="max-w-7xl mx-auto px-6 py-4 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
       <div class="flex items-center gap-3">
-        <i data-lucide="radar" class="text-accent w-7 h-7"></i>
+        <div class="brand-mark"><i data-lucide="radar" class="w-6 h-6"></i></div>
         <div>
-          <h1 class="text-lg font-semibold tracking-tight">API Spec Extractor</h1>
-          <p class="text-xs text-slate-400">Target Radar &amp; OpenAPI Reconstruction Command Center</p>
+          <h1 class="text-lg font-bold tracking-tight text-white">API Spec Extractor</h1>
+          <p class="text-xs text-slate-400">Target Radar Intelligence &amp; OpenAPI Reconstruction</p>
         </div>
       </div>
-      <nav class="flex gap-1 bg-surface/70 border border-edge rounded-lg p-1">
-        <button data-tab="radar" class="tab-button px-4 py-2 rounded-md text-sm font-medium flex items-center gap-2">
+      <div class="flex items-center gap-3">
+        <div class="stat-chip">
+          <span class="stat-chip-value" id="stat-total">0</span>
+          <span class="stat-chip-label">Total Programs</span>
+        </div>
+        <div class="stat-chip">
+          <span class="stat-chip-value text-amber" id="stat-scans">0</span>
+          <span class="stat-chip-label">Active Scans</span>
+        </div>
+        <div class="stat-chip">
+          <span class="stat-chip-value text-emerald flex items-center gap-1.5"><span class="pulse-dot"></span>Online</span>
+          <span class="stat-chip-label">Engine Status</span>
+        </div>
+      </div>
+    </div>
+    <div class="max-w-7xl mx-auto px-6 pb-3">
+      <nav class="flex gap-1 bg-surface/70 border border-edge rounded-xl p-1 w-fit">
+        <button data-tab="radar" class="tab-button px-4 py-2 rounded-lg text-sm font-medium flex items-center gap-2">
           <i data-lucide="crosshair" class="w-4 h-4"></i> Target Radar
         </button>
-        <button data-tab="jobs" class="tab-button px-4 py-2 rounded-md text-sm font-medium flex items-center gap-2">
+        <button data-tab="jobs" class="tab-button px-4 py-2 rounded-lg text-sm font-medium flex items-center gap-2">
           <i data-lucide="list-checks" class="w-4 h-4"></i> Scan Jobs
         </button>
-        <button data-tab="spec" class="tab-button px-4 py-2 rounded-md text-sm font-medium flex items-center gap-2">
+        <button data-tab="spec" class="tab-button px-4 py-2 rounded-lg text-sm font-medium flex items-center gap-2">
           <i data-lucide="file-json" class="w-4 h-4"></i> Spec Viewer
         </button>
       </nav>
     </div>
   </header>
 
-  <main class="max-w-7xl mx-auto px-6 py-8">
+  <main class="max-w-7xl mx-auto px-6 py-8 relative z-10">
     <section id="tab-radar" class="tab-panel">
-      <div class="flex flex-col md:flex-row md:items-end gap-4 mb-6">
+      <div id="hero-recommendation" class="mb-8"></div>
+
+      <div class="flex flex-col md:flex-row md:items-end gap-4 mb-5">
         <div class="flex-1">
-          <label class="block text-xs uppercase tracking-wide text-slate-400 mb-1">Search programs or domains</label>
-          <input id="radar-search" type="text" placeholder="Name, handle, or domain (e.g. wolt, agoda, tiktok)"
-            class="w-full bg-panel border border-edge rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-accent/60" />
+          <label class="block text-xs uppercase tracking-widest text-slate-400 mb-1.5">Search programs or domains</label>
+          <input id="radar-search" type="text" placeholder="Name, handle, or domain"
+            class="w-full bg-panel border border-edge rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-accent/60 transition" />
         </div>
-        <div class="w-44">
-          <label class="block text-xs uppercase tracking-wide text-slate-400 mb-1">Min response (%)</label>
-          <input id="radar-response" type="number" min="0" max="100" value="0" placeholder="0 - 100%"
-            class="w-full bg-panel border border-edge rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-accent/60" />
+        <div class="w-40">
+          <label class="block text-xs uppercase tracking-widest text-slate-400 mb-1.5">Sort by</label>
+          <select id="radar-sort"
+            class="w-full bg-panel border border-edge rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-accent/60 transition">
+            <option value="opportunity">Opportunity</option>
+            <option value="response">Response rate</option>
+            <option value="name">Name</option>
+          </select>
         </div>
         <button id="radar-search-btn"
-          class="bg-accent text-surface font-semibold px-5 py-2.5 rounded-lg text-sm flex items-center gap-2 hover:brightness-110 transition">
+          class="btn-primary px-5 py-2.5 rounded-xl text-sm flex items-center gap-2">
           <i data-lucide="search" class="w-4 h-4"></i> Search
         </button>
         <button id="radar-refresh-btn"
-          class="bg-panel border border-edge px-5 py-2.5 rounded-lg text-sm flex items-center gap-2 hover:border-accent/60 transition">
+          class="btn-ghost px-5 py-2.5 rounded-xl text-sm flex items-center gap-2">
           <i data-lucide="refresh-cw" class="w-4 h-4"></i> Refresh Feed
         </button>
       </div>
+
+      <div class="flex flex-wrap gap-2 mb-6" id="filter-pills">
+        <button class="filter-pill active" data-filter="all">All</button>
+        <button class="filter-pill" data-filter="s-tier">&#128293; S-Tier Opportunities</button>
+        <button class="filter-pill" data-filter="fast">&#9889; Fast Response (&gt;85%)</button>
+        <button class="filter-pill" data-filter="wildcard">&#127760; Wildcard Scope</button>
+      </div>
+
       <div id="radar-status" class="text-sm text-slate-400 mb-4">Loading active bounty programs...</div>
       <div id="radar-results" class="grid gap-4"></div>
     </section>
 
     <section id="tab-jobs" class="tab-panel hidden">
-      <div class="bg-panel border border-edge rounded-xl p-5 mb-6">
-        <label class="block text-xs uppercase tracking-wide text-slate-400 mb-2">Manual scan</label>
+      <div class="glass-card p-5 mb-6">
+        <label class="block text-xs uppercase tracking-widest text-slate-400 mb-2">Manual scan</label>
         <div class="flex gap-3">
           <input id="manual-url" type="text" placeholder="https://target.example.com"
-            class="flex-1 bg-surface border border-edge rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-accent/60" />
+            class="flex-1 bg-surface border border-edge rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-accent/60 transition" />
           <button id="manual-scan-btn"
-            class="bg-accent2 text-surface font-semibold px-5 py-2.5 rounded-lg text-sm flex items-center gap-2 hover:brightness-110 transition">
+            class="btn-secondary px-5 py-2.5 rounded-xl text-sm flex items-center gap-2">
             <i data-lucide="zap" class="w-4 h-4"></i> Scan API
           </button>
         </div>
