@@ -8,3 +8,4 @@ downloads/
 .vscode/
 output/
 .pytest_cache/
+data/
