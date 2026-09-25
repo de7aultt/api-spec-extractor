@@ -108,6 +108,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     source_group = parser.add_mutually_exclusive_group(required=True)
     source_group.add_argument("--url", metavar="TARGET_URL", help="Web application URL to analyze")
     source_group.add_argument("--file", metavar="LOCAL_JS_PATH", type=Path, help="Local JavaScript file (or saved HTML page) to analyze")
+    source_group.add_argument("--serve", action="store_true", help="Launch the interactive web dashboard")
     parser.add_argument("--output", metavar="DIR", type=Path, help="Output directory (overrides OUTPUT_DIR)")
     parser.add_argument("--max-scripts", type=int, help="Maximum number of scripts to download (overrides MAX_SCRIPTS)")
     parser.add_argument("--title", default=None, help="Title for the generated OpenAPI document")
@@ -372,6 +373,10 @@ def default_title(source_label: str) -> str:
 
 
 def run(arguments: argparse.Namespace) -> int:
+    if getattr(arguments, "serve", False):
+        from server import main as serve_main
+
+        return serve_main()
     settings = load_settings()
     output_dir = arguments.output or settings.output_dir
     max_scripts = arguments.max_scripts or settings.max_scripts

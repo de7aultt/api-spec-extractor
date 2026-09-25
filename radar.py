@@ -1,0 +1,170 @@
+import json
+import time
+from pathlib import Path
+
+import requests
+
+FEED_URL = "https://raw.githubusercontent.com/arkadiyt/bounty-targets-data/master/data/hackerone_data.json"
+DEFAULT_CACHE_PATH = Path("data/hackerone_targets.json")
+CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
+REQUEST_TIMEOUT_SECONDS = 30.0
+WEB_ASSET_TYPES = frozenset({"URL", "WILDCARD"})
+
+
+class RadarError(RuntimeError):
+    pass
+
+
+def _cache_is_fresh(cache_path: Path, max_age_seconds: float) -> bool:
+    if not cache_path.exists():
+        return False
+    age_seconds = time.time() - cache_path.stat().st_mtime
+    return age_seconds < max_age_seconds
+
+
+def _load_cache(cache_path: Path) -> list[dict]:
+    try:
+        raw_text = cache_path.read_text(encoding="utf-8")
+        data = json.loads(raw_text)
+    except (OSError, json.JSONDecodeError) as error:
+        raise RadarError(f"Failed to read cached targets from {cache_path}: {error}") from error
+    if not isinstance(data, list):
+        raise RadarError(f"Cached targets file {cache_path} does not contain a JSON list")
+    return data
+
+
+def _download_feed(feed_url: str, timeout: float) -> list[dict]:
+    try:
+        response = requests.get(feed_url, timeout=timeout)
+        response.raise_for_status()
+        data = response.json()
+    except (requests.RequestException, ValueError) as error:
+        raise RadarError(f"Failed to download target feed: {error}") from error
+    if not isinstance(data, list):
+        raise RadarError("Target feed did not return a JSON list")
+    return data
+
+
+def _save_cache(cache_path: Path, data: list[dict]) -> None:
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(data), encoding="utf-8")
+    except OSError as error:
+        raise RadarError(f"Failed to write target cache to {cache_path}: {error}") from error
+
+
+def fetch_or_load_targets(
+    force_refresh: bool = False,
+    cache_path: Path = DEFAULT_CACHE_PATH,
+    feed_url: str = FEED_URL,
+    timeout: float = REQUEST_TIMEOUT_SECONDS,
+) -> list[dict]:
+    cache_path = Path(cache_path)
+    if not force_refresh and _cache_is_fresh(cache_path, CACHE_MAX_AGE_SECONDS):
+        return _load_cache(cache_path)
+    try:
+        data = _download_feed(feed_url, timeout)
+    except RadarError:
+        if cache_path.exists():
+            return _load_cache(cache_path)
+        raise
+    _save_cache(cache_path, data)
+    return data
+
+
+def _coerce_float(value: object) -> float:
+    if isinstance(value, bool):
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        cleaned = value.replace("$", "").replace(",", "").strip()
+        try:
+            return float(cleaned)
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _extract_bounty_range(program: dict) -> tuple[float, float, float]:
+    minimum = _coerce_float(
+        program.get("bounty_min")
+        or program.get("minimum_bounty")
+        or program.get("bounty_low")
+    )
+    maximum = _coerce_float(
+        program.get("bounty_max")
+        or program.get("maximum_bounty")
+        or program.get("bounty_high")
+    )
+    average = _coerce_float(
+        program.get("average_bounty")
+        or program.get("average_bounty_lower_amount")
+    )
+    if average == 0.0 and (minimum or maximum):
+        if minimum and maximum:
+            average = (minimum + maximum) / 2
+        else:
+            average = maximum or minimum
+    return minimum, maximum, average
+
+
+def _clean_asset_identifier(identifier: object) -> str:
+    return str(identifier).strip()
+
+
+def _collect_in_scope_assets(program: dict, web_only: bool) -> list[str]:
+    targets = program.get("targets") or {}
+    in_scope = targets.get("in_scope") or []
+    domains: list[str] = []
+    for asset in in_scope:
+        if not isinstance(asset, dict):
+            continue
+        asset_type = str(asset.get("asset_type", "")).upper()
+        if web_only and asset_type not in WEB_ASSET_TYPES:
+            continue
+        identifier = asset.get("asset_identifier")
+        if not identifier:
+            continue
+        cleaned = _clean_asset_identifier(identifier)
+        if cleaned and cleaned not in domains:
+            domains.append(cleaned)
+    return domains
+
+
+def filter_targets(
+    programs: list[dict],
+    min_bounty: float = 0,
+    web_only: bool = True,
+    search_query: str = "",
+) -> list[dict]:
+    query = search_query.strip().lower()
+    results: list[dict] = []
+    for program in programs:
+        if not isinstance(program, dict):
+            continue
+        if not program.get("offers_bounties"):
+            continue
+        name = str(program.get("name", "")).strip()
+        handle = str(program.get("handle", "")).strip()
+        if query and query not in name.lower() and query not in handle.lower():
+            continue
+        minimum, maximum, average = _extract_bounty_range(program)
+        if min_bounty > 0 and maximum > 0 and maximum < min_bounty:
+            continue
+        domains = _collect_in_scope_assets(program, web_only)
+        if web_only and not domains:
+            continue
+        program_url = str(program.get("url", "")).strip() or f"https://hackerone.com/{handle}"
+        results.append(
+            {
+                "name": name or handle,
+                "handle": handle,
+                "url": program_url,
+                "bounty_min": minimum,
+                "bounty_max": maximum,
+                "average_bounty": average,
+                "in_scope_domains": domains,
+            }
+        )
+    return results
