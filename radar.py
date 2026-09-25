@@ -137,6 +137,7 @@ def filter_targets(
     min_bounty: float = 0,
     web_only: bool = True,
     search_query: str = "",
+    min_response_rate: float = 0,
 ) -> list[dict]:
     query = search_query.strip().lower()
     results: list[dict] = []
@@ -147,13 +148,20 @@ def filter_targets(
             continue
         name = str(program.get("name", "")).strip()
         handle = str(program.get("handle", "")).strip()
-        if query and query not in name.lower() and query not in handle.lower():
-            continue
-        minimum, maximum, average = _extract_bounty_range(program)
-        if min_bounty > 0 and maximum > 0 and maximum < min_bounty:
-            continue
         domains = _collect_in_scope_assets(program, web_only)
         if web_only and not domains:
+            continue
+        if query:
+            match_name = query in name.lower()
+            match_handle = query in handle.lower()
+            match_domain = any(query in domain.lower() for domain in domains)
+            if not (match_name or match_handle or match_domain):
+                continue
+        response_rate = _coerce_float(program.get("response_efficiency_percentage"))
+        if min_response_rate > 0 and response_rate < min_response_rate:
+            continue
+        minimum, maximum, average = _extract_bounty_range(program)
+        if min_bounty > 0 and maximum < min_bounty:
             continue
         program_url = str(program.get("url", "")).strip() or f"https://hackerone.com/{handle}"
         results.append(
@@ -164,6 +172,7 @@ def filter_targets(
                 "bounty_min": minimum,
                 "bounty_max": maximum,
                 "average_bounty": average,
+                "response_efficiency": response_rate,
                 "in_scope_domains": domains,
             }
         )

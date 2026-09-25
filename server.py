@@ -35,6 +35,7 @@ def _normalize_url(raw_url: str) -> str | None:
     candidate = (raw_url or "").strip()
     if not candidate or any(character.isspace() for character in candidate):
         return None
+    candidate = re.sub(r"^(?:https?://)?\*\.", "", candidate)
     if "://" not in candidate:
         candidate = f"https://{candidate}"
     parsed = urlparse(candidate)
@@ -184,10 +185,20 @@ def api_targets() -> Response:
     except ValueError:
         min_bounty = 0.0
     try:
+        min_response = float(request.args.get("response_min", "0", type=str) or 0)
+    except ValueError:
+        min_response = 0.0
+    try:
         programs = fetch_or_load_targets(force_refresh=refresh)
     except RadarError as error:
         return jsonify({"error": str(error), "targets": []}), 502
-    targets = filter_targets(programs, min_bounty=min_bounty, web_only=True, search_query=search_query)
+    targets = filter_targets(
+        programs,
+        min_bounty=min_bounty,
+        web_only=True,
+        search_query=search_query,
+        min_response_rate=min_response,
+    )
     return jsonify({"count": len(targets), "targets": targets})
 
 

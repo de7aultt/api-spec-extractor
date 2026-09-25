@@ -37,11 +37,11 @@ function escapeHtml(value) {
 }
 
 function formatBounty(target) {
+  if (target.response_efficiency && target.response_efficiency > 0) {
+    return `${Math.round(target.response_efficiency)}% response`;
+  }
   if (target.bounty_max && target.bounty_max > 0) {
     return `$${Math.round(target.bounty_max).toLocaleString()} max`;
-  }
-  if (target.average_bounty && target.average_bounty > 0) {
-    return `$${Math.round(target.average_bounty).toLocaleString()} avg`;
   }
   return "Bounty offered";
 }
@@ -50,10 +50,11 @@ async function loadTargets(forceRefresh) {
   const statusEl = document.getElementById("radar-status");
   const resultsEl = document.getElementById("radar-results");
   const search = document.getElementById("radar-search").value.trim();
-  const bounty = document.getElementById("radar-bounty").value.trim() || "0";
+  const responseEl = document.getElementById("radar-response") || document.getElementById("radar-bounty");
+  const minResponse = responseEl ? responseEl.value.trim() || "0" : "0";
   statusEl.textContent = forceRefresh ? "Refreshing feed from source..." : "Loading active bounty programs...";
   resultsEl.innerHTML = "";
-  const params = new URLSearchParams({ search, bounty_min: bounty });
+  const params = new URLSearchParams({ search, response_min: minResponse, bounty_min: minResponse });
   if (forceRefresh) {
     params.set("refresh", "true");
   }
@@ -82,11 +83,14 @@ function renderTargets(targets) {
       const domains = (target.in_scope_domains || [])
         .slice(0, 40)
         .map(
-          (domain) => `
+          (domain) => {
+            const cleanUrl = domain.replace(/^\*\./, "");
+            return `
             <div class="domain-chip">
               <span class="truncate">${escapeHtml(domain)}</span>
-              <button class="scan-chip-btn" data-scan-url="${escapeHtml(domain)}">&#9889; Scan API</button>
-            </div>`
+              <button class="scan-chip-btn" data-scan-url="${escapeHtml(cleanUrl)}">&#9889; Scan API</button>
+            </div>`;
+          }
         )
         .join("");
       return `
@@ -108,11 +112,18 @@ function renderTargets(targets) {
 
 async function startScan(url) {
   const manualStatus = document.getElementById("manual-status");
+  const cleanUrl = (url || "").trim().replace(/^https?:\/\/\*\./, "https://").replace(/^\*\./, "");
+  if (!cleanUrl) {
+    if (manualStatus) {
+      manualStatus.textContent = "Please enter a valid URL.";
+    }
+    return;
+  }
   try {
     const response = await fetch("/api/scan", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url })
+      body: JSON.stringify({ url: cleanUrl })
     });
     const data = await response.json();
     if (!response.ok) {
@@ -123,7 +134,7 @@ async function startScan(url) {
     }
     switchTab("jobs");
     if (manualStatus) {
-      manualStatus.textContent = `Scan started for ${url}`;
+      manualStatus.textContent = `Scan started for ${cleanUrl}`;
     }
     loadJobs();
   } catch (error) {
