@@ -213,6 +213,7 @@ function renderJob(job) {
         <div>
           <p class="font-mono text-sm text-slate-100 break-all">${escapeHtml(job.url)}</p>
           <p class="text-xs text-slate-500 mt-1">${escapeHtml(job.created_at)}</p>
+          ${job.target_dir ? `<p class="text-xs text-slate-500 font-mono mt-1 break-all">${escapeHtml(job.target_dir)}</p>` : ""}
         </div>
         <div class="flex items-center gap-3">${statusBadge(job.status)}${swaggerLink}</div>
       </div>

@@ -10,10 +10,10 @@ from urllib.parse import urlparse
 from flask import Flask, Response, abort, jsonify, render_template, request, send_file
 from werkzeug.exceptions import HTTPException, InternalServerError, NotFound
 
-from config import load_settings
+from config import load_settings, target_namespace_from_url
 
 BASE_DIR = Path(__file__).resolve().parent
-JOBS_ROOT = BASE_DIR / "output" / "jobs"
+OUTPUT_ROOT = BASE_DIR / "output"
 MAIN_SCRIPT = BASE_DIR / "main.py"
 MAX_LOG_LINES = 2000
 ALLOWED_SCHEMES = frozenset({"http", "https"})
@@ -58,6 +58,8 @@ def _job_public_view(job: dict) -> dict:
         "finished_at": job["finished_at"],
         "return_code": job["return_code"],
         "error": job["error"],
+        "target": job["target"],
+        "target_dir": job["target_dir"],
         "outputs": job["outputs"],
         "log": job["log"][-MAX_LOG_LINES:],
     }
@@ -142,9 +144,21 @@ def _run_job(job_id: str, url: str, job_dir: Path, has_api_key: bool) -> None:
     )
 
 
+def _job_directory_for(url: str, job_id: str) -> tuple[str, Path]:
+    target = target_namespace_from_url(url)
+    return target, OUTPUT_ROOT / target / job_id
+
+
+def _lookup_job_dir(job_id: str) -> Path | None:
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        job_dir = job["job_dir"] if job is not None else None
+    return Path(job_dir) if job_dir is not None else None
+
+
 def _create_job(url: str) -> dict:
     job_id = uuid.uuid4().hex
-    job_dir = JOBS_ROOT / job_id
+    target, job_dir = _job_directory_for(url, job_id)
     job_dir.mkdir(parents=True, exist_ok=True)
     job = {
         "job_id": job_id,
@@ -156,7 +170,9 @@ def _create_job(url: str) -> dict:
         "return_code": None,
         "error": None,
         "outputs": {key: False for key in DOWNLOAD_FILES},
+        "target": target,
         "job_dir": str(job_dir),
+        "target_dir": job_dir.relative_to(BASE_DIR).as_posix(),
         "log": [],
     }
     with _jobs_lock:
@@ -258,12 +274,10 @@ def api_scan_status(job_id: str) -> Response:
 
 @app.get("/api/openapi/<job_id>")
 def api_openapi(job_id: str) -> Response:
-    with _jobs_lock:
-        job = _jobs.get(job_id)
-        job_dir = job["job_dir"] if job is not None else None
+    job_dir = _lookup_job_dir(job_id)
     if job_dir is None:
         abort(404)
-    spec_path = Path(job_dir) / "openapi.json"
+    spec_path = job_dir / "openapi.json"
     if not spec_path.exists():
         abort(404)
     return send_file(spec_path, mimetype="application/json")
@@ -273,13 +287,11 @@ def api_openapi(job_id: str) -> Response:
 def download(job_id: str, file_type: str) -> Response:
     if file_type not in DOWNLOAD_FILES:
         abort(404)
-    with _jobs_lock:
-        job = _jobs.get(job_id)
-        job_dir = job["job_dir"] if job is not None else None
+    job_dir = _lookup_job_dir(job_id)
     if job_dir is None:
         abort(404)
     filename, content_type = DOWNLOAD_FILES[file_type]
-    file_path = Path(job_dir) / filename
+    file_path = job_dir / filename
     if not file_path.exists():
         abort(404)
     return send_file(file_path, mimetype=content_type, as_attachment=True, download_name=filename)
@@ -287,15 +299,14 @@ def download(job_id: str, file_type: str) -> Response:
 
 @app.get("/swagger/<job_id>")
 def swagger(job_id: str) -> str:
-    with _jobs_lock:
-        exists = job_id in _jobs
-    if not exists:
+    job_dir = _lookup_job_dir(job_id)
+    if job_dir is None:
         abort(404)
     return render_template("swagger.html", job_id=job_id)
 
 
 def create_app() -> Flask:
-    JOBS_ROOT.mkdir(parents=True, exist_ok=True)
+    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     return app
 
 

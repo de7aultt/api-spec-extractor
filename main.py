@@ -10,7 +10,13 @@ from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
-from config import ConfigurationError, Settings, load_settings
+from config import (
+    ConfigurationError,
+    Settings,
+    load_settings,
+    target_namespace_from_file,
+    target_namespace_from_url,
+)
 from exporter import ExportError, ExportedFiles, build_openapi_document, export_all
 from extractor import (
     DocumentAnalysis,
@@ -372,13 +378,21 @@ def default_title(source_label: str) -> str:
     return f"{Path(source_label).stem} API"
 
 
+def resolve_output_dir(arguments: argparse.Namespace, settings: Settings) -> Path:
+    if arguments.output:
+        return arguments.output
+    if arguments.url:
+        return settings.output_dir / target_namespace_from_url(arguments.url)
+    return settings.output_dir / target_namespace_from_file(arguments.file)
+
+
 def run(arguments: argparse.Namespace) -> int:
     if getattr(arguments, "serve", False):
         from server import main as serve_main
 
         return serve_main()
     settings = load_settings()
-    output_dir = arguments.output or settings.output_dir
+    output_dir = resolve_output_dir(arguments, settings)
     max_scripts = arguments.max_scripts or settings.max_scripts
     if max_scripts <= 0:
         raise ConfigurationError("--max-scripts must be greater than zero")

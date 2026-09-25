@@ -1,6 +1,8 @@
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -12,10 +14,31 @@ DEFAULT_REQUEST_TIMEOUT = 15.0
 DEFAULT_MAX_OUTPUT_TOKENS = 64000
 DEFAULT_BATCH_CHAR_BUDGET = 120000
 VALID_EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
+UNSAFE_NAMESPACE_CHARACTERS = re.compile(r"[^a-zA-Z0-9.-]")
+FALLBACK_NAMESPACE = "unknown_target"
 
 
 class ConfigurationError(ValueError):
     pass
+
+
+def sanitize_namespace(raw_value: str) -> str:
+    sanitized = UNSAFE_NAMESPACE_CHARACTERS.sub("_", raw_value.strip())
+    if not sanitized.strip("."):
+        return FALLBACK_NAMESPACE
+    return sanitized
+
+
+def target_namespace_from_url(url: str) -> str:
+    candidate = (url or "").strip()
+    if "://" not in candidate:
+        candidate = f"https://{candidate}"
+    hostname = urlparse(candidate).hostname or ""
+    return sanitize_namespace(hostname)
+
+
+def target_namespace_from_file(file_path: Path) -> str:
+    return sanitize_namespace(Path(file_path).stem)
 
 
 @dataclass(frozen=True)
